@@ -283,22 +283,29 @@ static void publishCounters()
 
 void CSimpleMtkBtPatcher::fixReadClock(StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor)
 {
-    /* HCI command: class request to the interface, host to device */
-    if ((request.bmRequestType & 0x80) != 0 || request.wLength != 6)
+    /* HCI command: class request, host to device */
+    if ((request.bmRequestType & 0x80) != 0 || (request.bmRequestType & 0x60) != 0x20 || request.wLength != 6)
         return;
     uint8_t cmd[6];
     if (data != nullptr) {
         memcpy(cmd, data, sizeof(cmd));
-    } else if (descriptor != nullptr && descriptor->prepare(kIODirectionInOut) == kIOReturnSuccess) {
+    } else if (descriptor != nullptr && descriptor->prepare(kIODirectionOut) == kIOReturnSuccess) {
+        /*
+         * Read with a read-only prepare and ask for write access only for
+         * the command to rewrite: write access on a buffer already
+         * prepared read-only fails and makes the kernel log a backtrace.
+         */
         bool ok = descriptor->readBytes(0, cmd, sizeof(cmd)) == sizeof(cmd);
-        if (ok && (cmd[0] | (cmd[1] << 8)) == HCI_OP_READ_CLOCK && cmd[2] == 3 && cmd[5] == 0) {
+        descriptor->complete(kIODirectionOut);
+        if (ok && (cmd[0] | (cmd[1] << 8)) == HCI_OP_READ_CLOCK && cmd[2] == 3 && cmd[5] == 0 &&
+            descriptor->prepare(kIODirectionInOut) == kIOReturnSuccess) {
             cmd[5] = 1;
             if (descriptor->writeBytes(5, &cmd[5], 1) == 1) {
                 readClockRewritten++;
                 publishCounters();
             }
+            descriptor->complete(kIODirectionInOut);
         }
-        descriptor->complete(kIODirectionInOut);
         return;
     } else {
         return;
@@ -328,27 +335,39 @@ IOReturn CSimpleMtkBtPatcher::newPipeIo(void *that, IOMemoryDescriptor *dataBuff
     IOUSBHostPipe *pipe = static_cast<IOUSBHostPipe *>(that);
     if (dataBuffer != nullptr && dataBufferLength >= 4 && dataBufferLength <= 1100) {
         const StandardUSB::EndpointDescriptor *ep = pipe->getEndpointDescriptor();
+        /*
+         * Every bulk OUT transfer of every USB device passes here. Read the
+         * header with a read-only prepare and ask for write access only for
+         * an ACL packet to rewrite: write access on a buffer its owner has
+         * already prepared read-only fails and makes the kernel log a
+         * backtrace, and USB mass storage does that for every SCSI command
+         * block it sends.
+         */
         if (ep != nullptr &&
             (ep->bmAttributes & 0x03) == 0x02 &&        /* bulk */
             (ep->bEndpointAddress & 0x80) == 0 &&       /* OUT */
-            dataBuffer->prepare(kIODirectionInOut) == kIOReturnSuccess) {
+            dataBuffer->prepare(kIODirectionOut) == kIOReturnSuccess) {
             uint8_t hdr[4];
+            uint16_t handle = 0, len = 0;
+            bool acl = false;
             if (dataBuffer->readBytes(0, hdr, sizeof(hdr)) == sizeof(hdr)) {
-                uint16_t handle = hdr[0] | (hdr[1] << 8);
-                uint16_t len = hdr[2] | (hdr[3] << 8);
+                handle = hdr[0] | (hdr[1] << 8);
+                len = hdr[2] | (hdr[3] << 8);
                 /* looks like HCI ACL: sane handle, length matches, PB = 0b10 */
-                if ((handle & 0x0fff) < 0x0f00 && len + 4u == dataBufferLength &&
-                    ((handle >> 12) & 3) == 2) {
-                    hdr[1] &= ~0x30;
-                    if (dataBuffer->writeBytes(1, &hdr[1], 1) == 1) {
-                        if (pbRewritten++ < 3)
-                            SYSLOG(DRV_NAME, "ACL PB flushable->non-flushable handle 0x%03x len %u", handle & 0x0fff, len);
-                        if ((++aclPbRewritten & 0x3ff) == 1)
-                            publishCounters();
-                    }
-                }
+                acl = (handle & 0x0fff) < 0x0f00 && len + 4u == dataBufferLength &&
+                    ((handle >> 12) & 3) == 2;
             }
-            dataBuffer->complete(kIODirectionInOut);
+            dataBuffer->complete(kIODirectionOut);
+            if (acl && dataBuffer->prepare(kIODirectionInOut) == kIOReturnSuccess) {
+                hdr[1] &= ~0x30;
+                if (dataBuffer->writeBytes(1, &hdr[1], 1) == 1) {
+                    if (pbRewritten++ < 3)
+                        SYSLOG(DRV_NAME, "ACL PB flushable->non-flushable handle 0x%03x len %u", handle & 0x0fff, len);
+                    if ((++aclPbRewritten & 0x3ff) == 1)
+                        publishCounters();
+                }
+                dataBuffer->complete(kIODirectionInOut);
+            }
         }
     }
     return FunctionCast(newPipeIo, callbackMtkBtPatcher->oldPipeIo)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
