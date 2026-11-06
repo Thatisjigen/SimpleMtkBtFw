@@ -76,6 +76,8 @@ static KernelPatcher::KextInfo SimpleMtkBtPatcher_IOUsbHostInfo {
 
 bool CSimpleMtkBtPatcher::_randomAddressInit = false;
 bool CSimpleMtkBtPatcher::_randomAddressHack = false;
+tUSBHostDeviceAddress CSimpleMtkBtPatcher::_mtkAddress = 0;
+bool CSimpleMtkBtPatcher::_mtkAddressValid = false;
 
 bool CSimpleMtkBtPatcher::init()
 {
@@ -187,11 +189,54 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 #define HCI_OP_LE_SET_SCAN_PARAM    0x200B
 #define HCI_OP_LE_SET_SCAN_ENABLE   0x200C
 
+#define MTK_BT_VENDOR_ID  0x13D3
+#define MTK_BT_PRODUCT_ID 0x3622
+
+/*
+ * The deviceRequest and pipe io hooks are installed on methods that every USB
+ * device goes through, but only the MediaTek controller (13D3:3622) must be
+ * touched: its HCI Read Clock reply is rewritten, and its bulk OUT ACL header
+ * flag is rewritten. Match the controller by the idVendor/idProduct registry
+ * properties, which need no USB I/O, and remember its bus address so the pipe
+ * hook -- which is only handed a pipe -- can tell the controller's transfers
+ * from every other device's.
+ *
+ * Do not call getDeviceDescriptor() here: deviceRequest also carries the
+ * requests that read that descriptor while a device enumerates, and asking for
+ * it from inside one of them leaves every USB device unenumerated.
+ */
+bool CSimpleMtkBtPatcher::isMtkBtDevice(void *device)
+{
+    IOUSBHostDevice *dev = OSDynamicCast(IOUSBHostDevice, static_cast<OSObject *>(device));
+    if (dev == nullptr)
+        return false;
+    OSNumber *vid = OSDynamicCast(OSNumber, dev->getProperty("idVendor"));
+    OSNumber *pid = OSDynamicCast(OSNumber, dev->getProperty("idProduct"));
+    bool match = vid != nullptr && pid != nullptr &&
+        vid->unsigned16BitValue() == MTK_BT_VENDOR_ID && pid->unsigned16BitValue() == MTK_BT_PRODUCT_ID;
+    if (match) {
+        _mtkAddress = dev->getAddress();
+        _mtkAddressValid = true;
+    } else if (_mtkAddressValid && dev->getAddress() == _mtkAddress) {
+        /* the controller's old bus address now belongs to another device */
+        _mtkAddressValid = false;
+    }
+    return match;
+}
+
 IOReturn CSimpleMtkBtPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
 {
     HciCommandHdr *hdr = nullptr;
     uint32_t hdrLen = 0;
     char hciBuf[MAX_HCI_BUF_LEN] = {0};
+
+    /*
+     * Only host-to-device class requests can carry HCI commands. Everything
+     * else, enumeration included, goes straight through before any check on
+     * the device.
+     */
+    if ((request.bmRequestType & 0xe0) != 0x20 || !isMtkBtDevice(that))
+        return FunctionCast(newHostDeviceRequest, callbackMtkBtPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
 
     fixReadClock(request, data, descriptor);
     
@@ -333,15 +378,15 @@ static uint32_t pbRewritten;
 IOReturn CSimpleMtkBtPatcher::newPipeIo(void *that, IOMemoryDescriptor *dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion *completion, uint32_t completionTimeoutMs)
 {
     IOUSBHostPipe *pipe = static_cast<IOUSBHostPipe *>(that);
-    if (dataBuffer != nullptr && dataBufferLength >= 4 && dataBufferLength <= 1100) {
+    if (_mtkAddressValid && dataBuffer != nullptr && dataBufferLength >= 4 && dataBufferLength <= 1100 &&
+        pipe->getDeviceAddress() == _mtkAddress) {
         const StandardUSB::EndpointDescriptor *ep = pipe->getEndpointDescriptor();
         /*
-         * Every bulk OUT transfer of every USB device passes here. Read the
-         * header with a read-only prepare and ask for write access only for
-         * an ACL packet to rewrite: write access on a buffer its owner has
-         * already prepared read-only fails and makes the kernel log a
-         * backtrace, and USB mass storage does that for every SCSI command
-         * block it sends.
+         * Only the MediaTek controller's bulk OUT transfers reach this branch.
+         * Read the header with a read-only prepare and ask for write access
+         * only for an ACL packet to rewrite: write access on a buffer its
+         * owner has already prepared read-only fails and makes the kernel log
+         * a backtrace.
          */
         if (ep != nullptr &&
             (ep->bmAttributes & 0x03) == 0x02 &&        /* bulk */
