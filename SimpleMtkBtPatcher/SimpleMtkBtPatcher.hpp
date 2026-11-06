@@ -99,9 +99,12 @@ public:
     mach_vm_address_t oldPipeIo {};
     
     static void fixReadClock(StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor);
+    static bool isMtkBtDevice(void *device);
 private:
     static bool _randomAddressInit;
     static bool _randomAddressHack;
+    static tUSBHostDeviceAddress _mtkAddress;
+    static bool _mtkAddressValid;
 };
 
 #endif /* SimpleMtkBtPatcher_h */
