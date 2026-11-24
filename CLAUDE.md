@@ -45,6 +45,11 @@ kmutil libraries -p build/Build/Products/Debug/SimpleMtkBtPatcher.kext --undef-s
 - `HCI_Read_Clock(handle, 0)`: MediaTek returns handle 0 and `bluetoothd`
   cannot match it; AAC-ELD to AirPods then never plays. The patcher sends
   `Which_Clock = 1`. Counters: `IOResources` → `SimpleMtkBtPatcher`.
+- At system sleep (priority sleep/wake interest) the patcher closes the
+  classic links that do not carry HID (L2CAP PSM 0x11/0x13): with an A2DP
+  link up the controller wakes the Mac at once. bluetoothd's "VS event mask
+  for sleep" (vendor OCF 0x103) fails on MediaTek and only covers vendor
+  events. Log: `IOResources` → `SimpleMtkBtSleep`.
 - `com.apple.MobileBluetooth.debug` → `A2DP.DisableAACELD` and
   `FastConnect.Disable*` have no effect on AirPods (fast connect still picks
   AAC-ELD); do not rely on them.

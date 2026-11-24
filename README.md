@@ -92,6 +92,9 @@ Embedded firmware: `BT_RAM_CODE_MT7961_1_2_hdr.bin`,
   shows how many HCI Read Clock commands and ACL packets were rewritten. If
   the key is missing, the patcher is not loaded (check Lilu and the kext
   order).
+* **What happened at sleep.** `ioreg -l -w0 | grep '"SimpleMtkBtSleep"'`
+  lists the links with their L2CAP PSMs, the last HCI commands with their
+  status and what the patcher did at each sleep and wake.
 * **`bluetoothd` keeps restarting / Bluetooth menu spins.** Check the NVRAM
   variables above. Crash reports in `/Library/Logs/DiagnosticReports` with
   `bcm_vsc.c` in the log mean `bluetoothd` thinks the chip is Broadcom.
@@ -152,6 +155,13 @@ CI builds Debug and Release on every push and pull request; pushing a tag
 * **ACL data as non-flushable.** The patcher also rewrites the ACL packet
   boundary flag from "automatically flushable" to "non-flushable" on bulk OUT
   transfers (`IOUSBHostPipe::io`), as Linux does for these controllers.
+* **Sleep with headphones connected.** A classic link that stays up (A2DP,
+  even paused) lets the controller wake the Mac within milliseconds of
+  sleeping. As Linux does before suspend, the patcher closes the classic
+  links that do not carry HID when the system goes to sleep; HID and LE
+  links stay, so keyboards and mice still wake the Mac. `-smbtsleepoff`
+  turns it off completely (no transfer is watched);
+  `sysctl debug.smbtp.sleepdisc=0` only stops the disconnecting.
 * **The Intel LE random-address workaround** inherited from
   IntelBluetoothFirmware is opt-in now (`-smbtrandaddr`).
 * **Debuggability.** A boot log ring buffer (`MtkBtLog` on the USB device),
